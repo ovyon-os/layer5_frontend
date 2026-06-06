@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+env:
+  PYTHON_VERSION: "3.14"
+  NODE_OPTIONS: --max_old_space_size=6144
+
+# Set default workflow permissions
+# All scopes not mentioned here are set to no access
+# https://docs.github.com/en/actions/security-guides/automatic-token-authentication#permissions-for-the-github_token
+permissions:
+  actions: none
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write # Required to upload release assets
+      id-token: write # For "Trusted Publisher" to PyPi
+    if: github.repository_owner == 'ovyon'
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Verify version
+        uses: ovyon/actions/helpers/verify-version@868e6cb4607727d764341a158d98872cd63fa658 # master
+
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: ".nvmrc"
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Download Translations
+        run: ./script/translations_download
+        env:
+          LOKALISE_TOKEN: ${{ secrets.LOKALISE_TOKEN }}
+
+      - name: Build and release package
+        run: |
+          python3 -m pip install build
+          export SKIP_FETCH_NIGHTLY_TRANSLATIONS=1
+          script/release
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          skip-existing: true
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG_NAME" dist/*.whl dist/*.tar.gz --clobber
+
+  wheels-init:
+    name: Init wheels build
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate requirements.txt
+        env:
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          version=$(echo "$GITHUB_REF" | awk -F"/" '{print $NF}' )
+          # Wait for the package to become available on PyPI
+          echo "Waiting for ovyon-frontend==$version to appear on PyPI..."
+          for i in $(seq 1 30); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/ovyon-frontend/$version/json")
+            if [ "$status" = "200" ]; then
+              echo "Package is available on PyPI!"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "Timed out waiting for package to appear on PyPI"
+              exit 1
+            fi
+            echo "Not available yet (HTTP $status), retrying in 30 seconds... ($i/30)"
+            sleep 30
+          done
+          echo "ovyon-frontend==$version" > ./requirements.txt
+
+      # ovyon/wheels doesn't support SHA pinning
+      - name: Build wheels
+        uses: ovyon/wheels@e5742a69d69f0e274e2689c998900c7d19652c21 # 2025.12.0
+        with:
+          abi: cp314
+          tag: musllinux_1_2
+          arch: amd64
+          wheels-key: ${{ secrets.WHEELS_KEY }}
+          requirements: "requirements.txt"
+
+  release-landing-page:
+    name: Release landing-page frontend
+    if: github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to upload release assets
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: ".nvmrc"
+      - name: Install dependencies
+        run: yarn install
+      - name: Download Translations
+        run: ./script/translations_download
+        env:
+          LOKALISE_TOKEN: ${{ secrets.LOKALISE_TOKEN }}
+      - name: Build landing-page
+        run: landing-page/script/build_landing_page
+      - name: Tar folder
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: tar -czf "landing-page/ovyon_frontend_landingpage-${TAG_NAME}.tar.gz" -C landing-page/dist .
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG_NAME" "landing-page/ovyon_frontend_landingpage-${TAG_NAME}.tar.gz" --clobber
